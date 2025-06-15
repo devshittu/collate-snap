@@ -1,0 +1,56 @@
+    # .github/workflows/snap-publish.yml
+    name: Build and Publish Snap
+
+    on:
+      push:
+        branches:
+          - main # This workflow runs when changes are pushed to the main branch
+        tags:
+          - 'v*.*.*' # Also run on version tags (e.g., v1.0.0) for stable releases
+
+    jobs:
+      build-and-publish:
+        runs-on: ubuntu-latest # Use the latest Ubuntu runner
+
+        steps:
+          - name: Checkout code
+            uses: actions/checkout@v4
+
+          - name: Install Snapcraft
+            # Snapcraft is a snap itself, so we install it via snap
+            run: |
+              sudo snap install snapcraft --classic
+
+          - name: Import Snapcraft Login
+            # Use the securely stored SNAPCRAFT_LOGIN secret
+            # The --with - tells snapcraft to read the login key from stdin
+            run: echo "${{ secrets.SNAPCRAFT_LOGIN }}" | snapcraft login --with -
+
+          - name: Build Snap
+            # Build the snap package. The snapcraft.yaml guides this process.
+            # Using --enable-snapd-integration allows testing snapd features (optional for simple scripts)
+            run: snapcraft --verbose # --verbose for detailed output during build
+
+          - name: Push Snap to Snapcraft
+            # Push the built .snap file to the Snapcraft store.
+            # Determine the channel based on the event: 'edge' for main branch pushes, 'stable' for tags.
+            run: |
+              # Get the snap file name (assuming it's collate_<version>_amd64.snap)
+              SNAP_FILE=$(find . -name "*.snap" | head -n 1)
+              
+              if [[ -z "$SNAP_FILE" ]]; then
+                echo "Error: No .snap file found after build."
+                exit 1
+              fi
+
+              # Determine release channel
+              RELEASE_CHANNEL="edge" # Default for pushes to main
+              if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" =~ ^refs/tags/v ]]; then
+                RELEASE_CHANNEL="stable" # If it's a version tag, release to stable
+                echo "Releasing to stable channel due to tag push."
+              else
+                echo "Releasing to edge channel for development pushes."
+              fi
+
+              snapcraft push "$SNAP_FILE" --release="$RELEASE_CHANNEL"
+    

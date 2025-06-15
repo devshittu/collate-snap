@@ -1,0 +1,14 @@
+services:
+  collate-test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - .:/app
+    tty: true
+    # init: true
+    # Privileged is often required for systemd and snapd to fully function within Docker.
+    # It allows the container to have extended capabilities.
+    # privileged: true
+    # No explicit command here, as ENTRYPOINT in Dockerfile handles systemd.
+    # You will use `docker compose exec` directly.

@@ -1,0 +1,51 @@
+title: Collate
+name: collate
+version: '0.1.0'
+summary: Combine files recursively into a single output file
+description: |
+  Collate is a command-line utility that recursively combines files into a single output file.
+  Features include configurable exclusions for directories and files, interactive prompts,
+  verbose mode, and progress indicators. Supports project-specific configurations
+  via .collate/config.yaml and system-wide settings at /etc/collate/config.yaml.
+  Use it to merge source code, logs, or Docker-related files (e.g., Dockerfile) with
+  customizable filters. Accessible via 'collate' or 'col8' commands.
+base: core22
+grade: stable
+confinement: strict
+icon: snap/gui/icon.png
+
+parts:
+  collate:
+    plugin: dump
+    source: .
+    organize:
+      collate.sh: bin/collate
+      config.yaml: etc/collate/config.yaml
+      icon.png: snap/gui/icon.png
+    stage:
+      - -tests/*
+      - -*.md
+      - -*.log
+      - -*.tmp
+      - -*.bak
+    stage-packages:
+      - bash
+      - coreutils
+      - findutils
+      - sed
+      - grep
+
+apps:
+  collate:
+    command: bin/collate
+    aliases: [collate, col8]
+    plugs:
+      - home
+      - removable-media
+license: MIT
+contact: devshittu@gmail.com
+categories:
+  - utilities
+  - development
+
+# snapcraft.yaml

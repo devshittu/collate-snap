@@ -1,0 +1,40 @@
+# System-wide configuration for collate
+# This file defines default exclusions for directories and files, typically
+# compiler-generated or temporary artifacts. Project-specific configs at
+# .collate/config.yaml can append to these or override with allow_dirs/allow_files.
+
+exclude_dirs:
+  - temp
+  - tmp
+  - cache
+  - build
+  - dist
+  - node_modules
+  - __pycache__
+  - .venv
+  - venv
+  - .cache
+  - out
+  - target
+  - bin
+  - obj
+
+exclude_files:
+  - "*.pyc"
+  - "*.pyo"
+  - "*.o"
+  - "*.obj"
+  - "*.class"
+  - "*.log"
+  - "*.bak"
+  - "*.swp"
+  - "*.tmp"
+  - "*.d.ts"
+  - "*.min.js"
+  - "*.min.css"
+  - "*.cache"
+  - "*.lock"
+
+exclude_dot_dirs: true
+
+# config.yaml
