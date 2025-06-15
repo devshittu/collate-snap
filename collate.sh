@@ -48,7 +48,6 @@ output_file_global=""
 absolute_input_path_global="" # Absolute resolved path of user's input
 absolute_output_file_global="" # Absolute resolved path of the final output file
 
-
 # --- Utility Functions (Must be defined BEFORE they are called) ---
 
 # Function to log messages (info, error, warning)
@@ -61,7 +60,6 @@ log_error() {
     exit "$exit_code"
 }
 log_warning() { echo -e "${YELLOW}$1${NC}"; } # log_warning itself uses -e for its argument
-
 
 # Function to check if a file has a valid extension
 has_extension() {
@@ -205,9 +203,9 @@ should_exclude() {
 
     # 1. Check against ALLOW_FILES (highest precedence)
     for allowed_file_pattern in "${ALLOW_FILES[@]}"; do
-        if [[ "$filename" == $allowed_file_pattern ]]; then # Using glob for patterns like *.log
-            return 1 # DO NOT exclude
-        fi
+        case "$filename" in
+            $allowed_file_pattern) return 1 ;; # DO NOT exclude
+        esac
     done
 
     # 2. Check against ALLOW_DIRS (highest precedence for directories)
@@ -264,9 +262,9 @@ should_exclude() {
 
     # 5. Check against EXCLUDE_FILES
     for excluded_file_pattern in "${EXCLUDE_FILES[@]}"; do
-        if [[ "$filename" == $excluded_file_pattern ]]; then # Using glob for patterns like *.log
-            return 0 # Exclude
-        fi
+        case "$filename" in
+            $excluded_file_pattern) return 0 ;; # Exclude
+        esac
     done
 
     return 1 # Do not exclude by default
@@ -538,7 +536,6 @@ uninit_project() {
         log_info "Non-interactive session: Automatically proceeding with .collate directory removal."
         confirm="y"
     fi
-
 
     rm -rf ".collate" || log_error "Failed to remove .collate directory" 1 # Explicit exit 1
     log_info ".collate directory removed successfully"
