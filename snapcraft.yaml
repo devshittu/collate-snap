@@ -44,8 +44,4 @@ apps:
       - removable-media
 license: MIT
 contact: devshittu@gmail.com
-categories:
-  - utilities
-  - development
-
 # snapcraft.yaml
