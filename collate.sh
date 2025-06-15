@@ -5,17 +5,389 @@
 # Supports project-specific configs (.collate/config.yaml) and system-wide settings (/etc/collate/config.yaml).
 # Commands: init (initialize project config), uninit (remove project config), <path> (combine files).
 
-# Configuration paths
-SYSTEM_CONFIG="/etc/collate/config.yaml"
+# Configuration paths - These paths are intentional and left as specified by the user.
+SYSTEM_CONFIG="$HOME/.collate/config.yaml"
 PROJECT_CONFIG=".collate/config.yaml"
-DEFAULT_OUTPUT="./temp/flat/output.txt"
+DEFAULT_OUTPUT="./.temp/flat/output.txt" # Changed to .temp as .collate is often hidden and .temp indicates temporary
 
-# ANSI color codes
-GREEN="\033[0;32m"
-RED="\033[0;31m"
-YELLOW="\033[0;33m"
-NC="\033[0m" # No Color
+# ANSI color codes - Conditionally set based on terminal interactivity
+# These variables will contain the color codes ONLY if output is a terminal.
+if [[ -t 1 ]]; then # Check if stdout is a terminal
+    GREEN="\033[0;32m"
+    RED="\033[0;31m"
+    YELLOW="\033[0;33m"
+    NC="\033[0m" # No Color
+else
+    GREEN=""
+    RED=""
+    YELLOW=""
+    NC="" # No Color
+fi
 
+# Global arrays for configurations (populated by load_config)
+declare -a SYSTEM_EXCLUDE_DIRS
+declare -a SYSTEM_EXCLUDE_FILES
+SYSTEM_EXCLUDE_DOT_DIRS_DEFAULT=true # Default system-wide setting (boolean)
+
+declare -a PROJECT_EXCLUDE_DIRS
+declare -a PROJECT_EXCLUDE_FILES
+PROJECT_EXCLUDE_DOT_DIRS="" # Will be overridden if specified in project config
+
+declare -a PROJECT_ALLOW_DIRS
+declare -a PROJECT_ALLOW_FILES
+
+declare -a EXCLUDE_DIRS # Combined list of excluded directories
+declare -a EXCLUDE_FILES # Combined list of excluded files
+declare -a ALLOW_DIRS # Combined list of allowed directories (project only)
+declare -a ALLOW_FILES # Combined list of allowed files (project only)
+EXCLUDE_DOT_DIRS_FINAL=false # Final boolean for dot directory exclusion after combining
+
+# Global variables for input and output paths (used across functions)
+input_path_global=""
+output_file_global=""
+absolute_input_path_global="" # Absolute resolved path of user's input
+absolute_output_file_global="" # Absolute resolved path of the final output file
+
+
+# --- Utility Functions (Must be defined BEFORE they are called) ---
+
+# Function to log messages (info, error, warning)
+log_info() { echo -e "${GREEN}$1${NC}"; }
+# log_error now takes an optional exit_code. Defaults to 1.
+log_error() {
+    local message="$1"
+    local exit_code="${2:-1}" # Default exit code is 1
+    echo -e "${RED}Error: $message${NC}" >&2
+    exit "$exit_code"
+}
+log_warning() { echo -e "${YELLOW}$1${NC}"; } # log_warning itself uses -e for its argument
+
+
+# Function to check if a file has a valid extension
+has_extension() {
+    local filename="$1"
+    [[ "$filename" =~ \.[a-zA-Z0-9]+$ ]] && return 0 || return 1
+}
+
+# Function to prompt for overwrite confirmation
+prompt_overwrite() {
+    local output_file_path="$1" # Use a distinct variable name for clarity
+    if [[ -f "$output_file_path" ]]; then
+        log_warning "Output file '$output_file_path' already exists." # This uses log_warning which will apply colors if interactive
+
+        local prompt_string="Overwrite? (y/N): "
+        if [[ -t 1 ]]; then
+            read -p "${YELLOW}${prompt_string}${NC}" confirm
+        else
+            # For non-interactive, print raw prompt without colors
+            read -p "${prompt_string}" confirm
+        fi
+        
+        if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+            log_error "Operation cancelled by user." 1 # Explicitly exit with 1 on cancellation
+        fi
+    fi
+}
+
+# Function to parse YAML (simple key-value parser for shell)
+parse_yaml() {
+    local file="$1"
+    local prefix="$2" # SYSTEM or PROJECT
+    if [[ ! -f "$file" ]]; then
+        return
+    fi
+    local current_key=""
+    while IFS= read -r line; do
+        # Remove leading/trailing whitespace
+        line=$(echo "$line" | sed -e 's/^[ \t]*//' -e 's/[ \t]*$//')
+        # Skip comments and empty lines
+        [[ "$line" =~ ^# || -z "$line" ]] && continue
+        
+        # Handle key: value pairs
+        if [[ "$line" =~ ^[a-zA-Z_]+: ]]; then
+            current_key=$(echo "$line" | cut -d':' -f1 | tr -d ' ')
+            local value=$(echo "$line" | cut -d':' -f2- | sed -e 's/^[ \t]*//' -e 's/[ \t]*$//')
+            
+            if [[ "$current_key" == "exclude_dot_dirs" ]]; then
+                if [[ "$prefix" == "SYSTEM" ]]; then
+                    SYSTEM_EXCLUDE_DOT_DIRS_DEFAULT="$value"
+                else
+                    PROJECT_EXCLUDE_DOT_DIRS="$value"
+                fi
+            fi
+        # Handle array items (start with - )
+        elif [[ "$line" =~ ^-\  ]]; then # Ensure space after hyphen
+            local value=$(echo "$line" | sed 's/^- //')
+            if [[ "$current_key" == "exclude_dirs" ]]; then
+                if [[ "$prefix" == "SYSTEM" ]]; then
+                    SYSTEM_EXCLUDE_DIRS+=("$value")
+                else
+                    PROJECT_EXCLUDE_DIRS+=("$value")
+                fi
+            elif [[ "$current_key" == "allow_dirs" ]]; then
+                PROJECT_ALLOW_DIRS+=("$value")
+            elif [[ "$current_key" == "exclude_files" ]]; then
+                if [[ "$prefix" == "SYSTEM" ]]; then
+                    SYSTEM_EXCLUDE_FILES+=("$value")
+                else
+                    PROJECT_EXCLUDE_FILES+=("$value")
+                fi
+            elif [[ "$current_key" == "allow_files" ]]; then
+                PROJECT_ALLOW_FILES+=("$value")
+            fi
+        else
+            # If line is not a key-value or array item, reset current_key
+            current_key=""
+        fi
+    done < "$file"
+}
+
+# Function to load configurations
+load_config() {
+    # Reset arrays to ensure clean state on repeated calls (e.g., in tests)
+    SYSTEM_EXCLUDE_DIRS=()
+    SYSTEM_EXCLUDE_FILES=()
+    SYSTEM_EXCLUDE_DOT_DIRS_DEFAULT=true
+    PROJECT_EXCLUDE_DIRS=()
+    PROJECT_EXCLUDE_FILES=()
+    PROJECT_EXCLUDE_DOT_DIRS=""
+    PROJECT_ALLOW_DIRS=()
+    PROJECT_ALLOW_FILES=()
+
+    # Load system-wide config
+    parse_yaml "$SYSTEM_CONFIG" "SYSTEM"
+
+    # Load project-specific config if present
+    if [[ -f "$PROJECT_CONFIG" ]]; then
+        parse_yaml "$PROJECT_CONFIG" "PROJECT"
+    fi
+
+    # Combine configurations (project appends to system unless overridden by 'allow')
+    # Combine EXCLUDE_DIRS
+    EXCLUDE_DIRS=("${SYSTEM_EXCLUDE_DIRS[@]}")
+    for proj_dir in "${PROJECT_EXCLUDE_DIRS[@]}"; do
+        EXCLUDE_DIRS+=("$proj_dir")
+    done
+
+    # Combine EXCLUDE_FILES
+    EXCLUDE_FILES=("${SYSTEM_EXCLUDE_FILES[@]}")
+    for proj_file in "${PROJECT_EXCLUDE_FILES[@]}"; do
+        EXCLUDE_FILES+=("$proj_file")
+    done
+
+    # ALLOW lists are only from project config, as per design
+    ALLOW_DIRS=("${PROJECT_ALLOW_DIRS[@]}")
+    ALLOW_FILES=("${PROJECT_ALLOW_FILES[@]}")
+    
+    # Final EXCLUDE_DOT_DIRS setting: project setting takes precedence, then system setting
+    local dot_dirs_setting="${PROJECT_EXCLUDE_DOT_DIRS:-$SYSTEM_EXCLUDE_DOT_DIRS_DEFAULT}"
+    [[ "$dot_dirs_setting" == "true" ]] && EXCLUDE_DOT_DIRS_FINAL=true || EXCLUDE_DOT_DIRS_FINAL=false
+}
+
+# Function to check if a file/directory should be excluded
+should_exclude() {
+    local path="$1"
+    local filename=$(basename "$path")
+    local dirname_only=$(dirname "$path") # The directory part of the path
+    local relative_path_to_check="$path" # Start with full path
+    
+    # Crucial: Exclude the output file itself right away
+    if [[ "$path" == "$absolute_output_file_global" ]]; then
+        return 0 # Exclude
+    fi
+
+    # If the path starts with the current working directory, make it relative for pattern matching
+    # This ensures consistency with config entries like "temp/"
+    local current_wd_for_exclude=$(pwd) # Use a distinct local variable
+    if [[ "$path" == "$current_wd_for_exclude/"* ]]; then
+        relative_path_to_check="${path#$current_wd_for_exclude/}"
+    fi
+
+    # 1. Check against ALLOW_FILES (highest precedence)
+    for allowed_file_pattern in "${ALLOW_FILES[@]}"; do
+        if [[ "$filename" == $allowed_file_pattern ]]; then # Using glob for patterns like *.log
+            return 1 # DO NOT exclude
+        fi
+    done
+
+    # 2. Check against ALLOW_DIRS (highest precedence for directories)
+    for allowed_dir_pattern in "${ALLOW_DIRS[@]}"; do
+        # Check if the path or any of its parent directories match an allowed directory pattern
+        # This handles cases like 'test_dir/subdir/file.txt' matching 'test_dir'
+        if [[ "$relative_path_to_check" == "$allowed_dir_pattern"* ]]; then
+            return 1 # DO NOT exclude
+        fi
+        # Also check if the exact dirname matches
+        if [[ "$dirname_only" == *"/$allowed_dir_pattern" ]]; then
+            return 1 # DO NOT exclude
+        fi
+    done
+
+    # 3. Check for dot directories exclusion if enabled
+    if [[ "$EXCLUDE_DOT_DIRS_FINAL" == true ]]; then
+        # Check if any component in the path (including filename) starts with a dot
+        local temp_path_for_dots="$relative_path_to_check"
+        while [[ "$temp_path_for_dots" != "." && "$temp_path_for_dots" != "/" ]]; do
+            local current_segment=$(basename "$temp_path_for_dots")
+            if [[ "$current_segment" == .* && "$current_segment" != "." && "$current_segment" != ".." ]]; then
+                # Ensure it's not the root of the search
+                if [[ "$relative_path_to_check" != "." ]]; then # Avoid excluding the root itself if it's a dot-dir
+                    return 0 # Exclude
+                fi
+            fi
+            # Check if we've reached the base of the input path to prevent infinite loops for relative paths
+            if [[ "$temp_path_for_dots" == "$(basename "$absolute_input_path_global")" || \
+                  "$temp_path_for_dots" == "$absolute_input_path_global" ]]; then break; fi
+            temp_path_for_dots=$(dirname "$temp_path_for_dots")
+        done
+        # Special case: If the input path itself is a dot-dir (e.g., .collate), and exclude_dot_dirs is true, exclude it.
+        if [[ "$(basename "$absolute_input_path_global")" == .* && "$absolute_input_path_global" == "$path" ]]; then
+             return 0 # Exclude
+        fi
+    fi
+
+    # 4. Check against EXCLUDE_DIRS
+    for excluded_dir_pattern in "${EXCLUDE_DIRS[@]}"; do
+        # Check if the path or any of its parent directories match an excluded directory pattern
+        if [[ "$relative_path_to_check" == *"$excluded_dir_pattern"* ]]; then # Covers /path/to/excluded_dir/file
+            return 0 # Exclude
+        fi
+        # Check if the specific directory name (basename) matches the pattern
+        if [[ "$filename" == "$excluded_dir_pattern" ]]; then # Covers exact dir name match like "temp"
+            return 0 # Exclude
+        fi
+        # Check if any part of the path matches a full segment
+        if [[ "$relative_path_to_check" =~ (^|/)"$excluded_dir_pattern"(|/|$) ]]; then
+            return 0 # Exclude
+        fi
+    done
+
+    # 5. Check against EXCLUDE_FILES
+    for excluded_file_pattern in "${EXCLUDE_FILES[@]}"; do
+        if [[ "$filename" == $excluded_file_pattern ]]; then # Using glob for patterns like *.log
+            return 0 # Exclude
+        fi
+    done
+
+    return 1 # Do not exclude by default
+}
+
+# Function to display progress bar
+show_progress() {
+    local current="$1"
+    local total="$2"
+    local width=50
+    local percent=$((current * 100 / total))
+    local filled=$((width * current / total))
+    local empty=$((width - filled))
+    local bar=$(printf "%${filled}s" | tr ' ' '#')
+    bar+=$(printf "%${empty}s" | tr ' ' '-')
+    printf "\r${GREEN}Progress: %d%% (%d/%d files) [%s]${NC}" "$percent" "$current" "$total" "$bar"
+}
+
+# Function to flatten files
+flatten_files() {
+    local input_path="$1"
+    local output_file="$2" # This is the resolved output file path
+    local verbose="$3"
+    
+    # Resolve and set global input and output path variables
+    absolute_input_path_global=$(realpath -m "$input_path" 2>/dev/null)
+    if [[ -z "$absolute_input_path_global" || (! -d "$absolute_input_path_global" && ! -f "$absolute_input_path_global") ]]; then
+        log_error "Input path '$input_path' does not exist."
+    fi
+    # Use the provided input_path directly for relative path calculations later
+    input_path_global="$input_path" 
+
+    # Ensure output directory exists before resolving output_file_global
+    local output_dir=$(dirname "$output_file")
+    mkdir -p "$output_dir" || log_error "Failed to create output directory: $output_dir"
+
+    # Resolve and set the global absolute output file path
+    absolute_output_file_global=$(realpath -m "$output_file" 2>/dev/null)
+    output_file_global="$output_file" # Keep the original output file name for logs/prompts
+
+    # Check for existing output file and prompt for overwrite, only if file exists
+    prompt_overwrite "$output_file"
+
+    # Clear or create the output file
+    : > "$output_file" || log_error "Failed to create/write to output file: $output_file"
+
+    local all_files_found=()
+    # First pass: Collect all files, find will give absolute paths
+    while IFS= read -r -d '' f; do
+        all_files_found+=("$f")
+    done < <(find "$absolute_input_path_global" -type f -print0 2>/dev/null)
+
+    local files_to_process=()
+    for file_abs_path in "${all_files_found[@]}"; do
+        if ! should_exclude "$file_abs_path"; then
+            files_to_process+=("$file_abs_path")
+        fi
+    done
+
+    local total_files_to_process=${#files_to_process[@]}
+    if [[ "$total_files_to_process" -eq 0 ]]; then
+        log_error "No files found to process after applying exclusions. Check input path or configuration."
+    fi
+
+    local processed_count=0
+    # Capture current working directory once for relative path calculations inside the loop
+    local current_wd=$(pwd) 
+
+    for file_absolute_path in "${files_to_process[@]}"; do
+        ((processed_count++))
+        
+        # Calculate the path to display in the output file header
+        local path_in_header=""
+        
+        # Get the absolute path of the input directory for relative calculation
+        local abs_input_path_dir=$(realpath -m "$input_path_global" 2>/dev/null)
+        
+        if [[ "$file_absolute_path" == "$abs_input_path_dir/"* ]]; then
+            # If the file is under the absolute input directory, make it relative to the original input
+            path_in_header="${input_path_global}/${file_absolute_path#$abs_input_path_dir/}"
+        elif [[ "$file_absolute_path" == "$current_wd/"* ]]; then
+            # If not under input dir, but under current working directory, make it relative to current WD
+            path_in_header="${file_absolute_path#$current_wd/}"
+        else
+            # Fallback to just the basename if it's an unusual path, or simply the full path.
+            # For robustness, let's keep it relative to current_wd if possible, otherwise use basename
+            if [[ "$file_absolute_path" == /* ]]; then # If it's an absolute path
+                 path_in_header="${file_absolute_path#$current_wd/}" # Try to make it relative to current WD
+                 if [[ "$path_in_header" == "$file_absolute_path" ]]; then # If still absolute, just use basename
+                     path_in_header=$(basename "$file_absolute_path")
+                 fi
+            else
+                path_in_header="$file_absolute_path" # It's already relative
+            fi
+        fi
+
+        # If the input was a single file and matches the current file
+        if [[ -f "$absolute_input_path_global" && "$file_absolute_path" == "$absolute_input_path_global" ]]; then
+            path_in_header=$(basename "$input_path_global")
+        fi
+
+        [[ "$verbose" == "true" ]] && log_info "Processed: $path_in_header (Full path: $file_absolute_path)"
+        [[ "$verbose" != "true" ]] && show_progress "$processed_count" "$total_files_to_process"
+
+        # Append file path and content to output
+        {
+            echo "===== FILE: $path_in_header =====" # Display the user-friendly relative path
+            cat "$file_absolute_path" 2>/dev/null || log_error "Failed to read file: $file_absolute_path"
+            echo -e "\n===== END: $path_in_header =====\n" # Display the user-friendly relative path
+        } >> "$output_file" || log_error "Failed to append to output file: $output_file"
+    done
+
+    [[ "$verbose" != "true" ]] && echo "" # Newline after progress bar
+    if [[ ! -s "$output_file" ]]; then # Check if the output file is empty
+        log_error "No content was written to '$output_file'. This might indicate an issue with file processing."
+    fi
+
+    log_info "Files combined successfully into '$output_file'" # Use single quotes for consistency
+}
+
+# --- Command-Specific Help Functions ---
 # Function to display usage
 usage() {
     cat << EOF
@@ -84,106 +456,7 @@ EOF
     exit 0
 }
 
-# Function to log messages (info, error, warning)
-log_info() { echo -e "${GREEN}$1${NC}"; }
-log_error() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
-log_warning() { echo -e "${YELLOW}Warning: $1${NC}"; }
-
-# Function to check if a file has a valid extension
-has_extension() {
-    local filename="$1"
-    [[ "$filename" =~ \.[a-zA-Z0-9]+$ ]] && return 0 || return 1
-}
-
-# Function to prompt for overwrite confirmation
-prompt_overwrite() {
-    local output_file="$1"
-    if [[ -f "$output_file" && -t 1 ]]; then
-        log_warning "Output file '$output_file' already exists."
-        read -p "${YELLOW}Overwrite? (y/N): ${NC}" confirm
-        if [[ ! "$confirm" =~ ^[yY]$ ]]; then
-            log_error "Operation cancelled by user."
-        fi
-    fi
-}
-
-# Function to parse YAML (simple key-value parser for shell)
-parse_yaml() {
-    local file="$1"
-    local prefix="$2" # SYSTEM or PROJECT
-    if [[ ! -f "$file" ]]; then
-        return
-    fi
-    local current_key=""
-    while IFS=': ' read -r key value; do
-        # Skip comments and empty lines
-        [[ "$key" =~ ^# || -z "$key" ]] && continue
-        # Handle array items
-        if [[ "$key" =~ ^- ]]; then
- ව
-            if [[ "$current_key" == "exclude_dirs" || "$current_key" == "allow_dirs" ]]; then
-                value=$(echo "$key" | sed 's/^- //')
-                if [[ "$current_key" == "exclude_dirs" ]]; then
-                    if [[ "$prefix" == "SYSTEM" ]]; then
-                        SYSTEM_EXCLUDE_DIRS+=("$value")
-                    else
-                        PROJECT_EXCLUDE_DIRS+=("$value")
-                    fi
-                elif [[ "$current_key" == "allow_dirs" ]]; then
-                    PROJECT_ALLOW_DIRS+=("$value")
-                fi
-            elif [[ "$current_key" == "exclude_files" || "$current_key" == "allow_files" ]]; then
-                value=$(echo "$key" | sed 's/^- //')
-                if [[ "$current_key" == "exclude_files" ]]; then
-                    if [[ "$prefix" == "SYSTEM" ]]; then
-                        SYSTEM_EXCLUDE_FILES+=("$value")
-                    else
-                        PROJECT_EXCLUDE_FILES+=("$value")
-                    fi
-                elif [[ "$current_key" == "allow_files" ]]; then
-                    PROJECT_ALLOW_FILES+=("$value")
-                fi
-            fi
-        else
-            current_key="$key"
-            if [[ "$current_key" == "exclude_dot_dirs" ]]; then
-                if [[ "$prefix" == "SYSTEM" ]]; then
-                    SYSTEM_EXCLUDE_DOT_DIRS="$value"
-                else
-                    PROJECT_EXCLUDE_DOT_DIRS="$value"
-                fi
-            fi
-        fi
-    done < <(grep -E '^[a-zA-Z_]+:|^-' "$file" | sed -e 's/^[ \t]*//' -e 's/[ \t]*$//')
-}
-
-# Function to load configurations
-load_config() {
-    # Default values
-    SYSTEM_EXCLUDE_DIRS=()
-    SYSTEM_EXCLUDE_FILES=()
-    SYSTEM_EXCLUDE_DOT_DIRS=true
-    PROJECT_EXCLUDE_DIRS=()
-    PROJECT_EXCLUDE_FILES=()
-    PROJECT_EXCLUDE_DOT_DIRS=""
-    PROJECT_ALLOW_DIRS=()
-    PROJECT_ALLOW_FILES=()
-
-    # Load system-wide config
-    parse_yaml "$SYSTEM_CONFIG" "SYSTEM"
-
-    # Load project-specific config if present
-    if [[ -f "$PROJECT_CONFIG" ]]; then
-        parse_yaml "$PROJECT_CONFIG" "PROJECT"
-    fi
-
-    # Combine configurations (project appends to system)
-    EXCLUDE_DIRS=("${SYSTEM_EXCLUDE_DIRS[@]}" "${PROJECT_EXCLUDE_DIRS[@]}")
-    EXCLUDE_FILES=("${SYSTEM_EXCLUDE_FILES[@]}" "${PROJECT_EXCLUDE_FILES[@]}")
-    ALLOW_DIRS=("${PROJECT_ALLOW_DIRS[@]}")
-    ALLOW_FILES=("${PROJECT_ALLOW_FILES[@]}")
-    EXCLUDE_DOT_DIRS=${PROJECT_EXCLUDE_DOT_DIRS:-$SYSTEM_EXCLUDE_DOT_DIRS}
-}
+# --- Project Management Functions ---
 
 # Function to initialize .collate directory
 init_project() {
@@ -199,8 +472,14 @@ init_project() {
     # Create config.yaml with system-wide exclusions as comments
     local system_excludes=""
     if [[ -f "$SYSTEM_CONFIG" ]]; then
-        system_excludes=$(grep -E 'exclude_dirs|exclude_files' "$SYSTEM_CONFIG" | sed 's/^/# From system config: /')
+        # Use grep -v for comments, and sed to format for output
+        system_excludes=$(grep -E 'exclude_dirs:|exclude_files:|exclude_dot_dirs:' "$SYSTEM_CONFIG" | \
+                          sed -E 's/^(exclude_dirs|exclude_files|exclude_dot_dirs):/# From system config: \1:/g; s/^- /#  - /g')
+        # Also include any array items not directly under a key line
+        system_excludes+=$(grep -E '^[[:space:]]*- ' "$SYSTEM_CONFIG" | \
+                           sed 's/^[[:space:]]*- /#  - /g')
     fi
+
     cat << EOF > ".collate/config.yaml"
 # Project-specific configuration for collate
 # Appends to system-wide settings at /etc/collate/config.yaml
@@ -208,22 +487,26 @@ init_project() {
 $system_excludes
 
 # Directories to exclude (add to system-wide exclusions)
-exclude_dirs:
-  - cache
-  - build
+# Example:
+# exclude_dirs:
+#   - cache
+#   - build
 
 # Files to exclude (add to system-wide exclusions)
-exclude_files:
-  - "*.log"
-  - "*.o"
+# Example:
+# exclude_files:
+#   - "*.log"
+#   - "*.o"
 
 # Directories or files to allow (overrides system-wide exclusions)
-allow_dirs:
-  - .git
-allow_files:
-  - ".gitignore"
+# Example:
+# allow_dirs:
+#   - .git
+# allow_files:
+#   - ".gitignore"
 
 # Exclude directories starting with a dot (true/false, defaults to system-wide)
+# Example:
 # exclude_dot_dirs: true
 EOF
 
@@ -241,101 +524,37 @@ uninit_project() {
         uninit_help
     fi
     if [[ ! -d ".collate" ]]; then
-        log_error ".collate directory does not exist in $(pwd)"
+        log_error ".collate directory does not exist in $(pwd)" 1 # Explicit exit 1
     fi
 
-    if [[ -t 1 ]]; then
+    if [[ -t 1 ]]; then # Check if connected to a terminal (interactive)
         log_warning "This will remove the .collate directory and its contents."
         read -p "${YELLOW}Proceed? (y/N): ${NC}" confirm
         if [[ ! "$confirm" =~ ^[yY]$ ]]; then
-            log_error "Operation cancelled by user."
+            log_error "Operation cancelled by user." 1 # Explicit exit 1
         fi
+    else
+        # Non-interactive, auto-confirm remove
+        log_info "Non-interactive session: Automatically proceeding with .collate directory removal."
+        confirm="y"
     fi
 
-    rm -rf ".collate" || log_error "Failed to remove .collate directory"
+
+    rm -rf ".collate" || log_error "Failed to remove .collate directory" 1 # Explicit exit 1
     log_info ".collate directory removed successfully"
     exit 0
 }
 
-# Function to display progress bar
-show_progress() {
-    local current="$1"
-    local total="$2"
-    local width=50
-    local percent=$((current * 100 / total))
-    local filled=$((width * current / total))
-    local empty=$((width - filled))
-    local bar=$(printf "%${filled}s" | tr ' ' '#')
-    bar+=$(printf "%${empty}s" | tr ' ' '-')
-    printf "\r${GREEN}Progress: %d%% (%d/%d files) [%s]${NC}" "$percent" "$current" "$total" "$bar"
-}
+# --- Main Script Logic ---
 
-# Function to flatten files
-flatten_files() {
-    local input_path="$1"
-    local output_file="$2"
-    local verbose="$3"
+# Load initial config (needed if combine command is run directly without explicit init)
+load_config # This needs to be called once at the start of the script
 
-    # Resolve the input path to absolute
-    input_path=$(realpath -m "$input_path" 2>/dev/null) || log_error "Failed to resolve path: $input_path"
-    if [[ ! -d "$input_path" && ! -f "$input_path" ]]; then
-        log_error "Input path does not exist: $input_path"
-    fi
-
-    # Ensure output directory exists
-    local output_dir=$(dirname "$output_file")
-    mkdir -p "$output_dir" || log_error "Failed to create output directory: $output_dir"
-
-    # Check for existing output file and prompt for overwrite
-    prompt_overwrite "$output_file"
-
-    # Clear or create the output file
-    : > "$output_file" || log_error "Failed to create/write to output file: $output_file"
-
-    # Count total files for progress
-    local total_files=$(find "$input_path" -type f -print0 2>/dev/null | grep -zc .)
-    [[ $total_files -eq 0 ]] && log_error "No files found in $input_path. Check exclusions or path."
-
-    local current_file=0
-    # Process files
-    while IFS= read -r -d '' file; do
-        # Skip if file or its parent directories should be excluded
-        if should_exclude "$file"; then
-            continue
-        fi
-
-        # Skip directories
-        if [[ -d "$file" ]]; then
-            continue
-        fi
-
-        # Update progress
-        ((current_file++))
-        [[ "$verbose" == "true" ]] && log_info "Processed: $file"
-        [[ "$verbose" != "true" ]] && show_progress "$current_file" "$total_files"
-
-        # Append file path and content to output
-        {
-            echo "===== FILE: $file ====="
-            cat "$file" 2>/dev/null || log_error "Failed to read file: $file"
-            echo -e "\n===== END: $file =====\n"
-        } >> "$output_file" || log_error "Failed to append to output file: $output_file"
-    done < <(find "$input_path" -type f -print0 2>/dev/null)
-
-    [[ "$verbose" != "true" ]] && echo "" # Newline after progress bar
-    if [[ ! -s "$output_file" ]]; then
-        log_error "No files were processed. Check exclusions or input path."
-    fi
-
-    log_info "Files combined successfully into $output_file"
-}
-
-# Main script
+# Main script execution logic (no 'local' outside functions)
 if [[ $# -eq 0 ]]; then
     usage
 fi
 
-# Parse command
 COMMAND="$1"
 shift
 
@@ -352,42 +571,67 @@ case "$COMMAND" in
     *)
         # Treat command as input path for combining
         INPUT_PATH="$COMMAND"
-        OUTPUT_FILE="$DEFAULT_OUTPUT"
-        VERBOSE=false
+        OUTPUT_FILE_OPT_PROVIDED=false # Flag to track if -o was explicitly provided
 
-        # Parse options
-        while getopts "o:v" opt; do
+        OPTIND=1 # Reset OPTIND for current getopts call
+
+        while getopts ":o:v" opt; do # Colon before o indicates it takes an argument
             case $opt in
                 o)
                     OUTPUT_FILE="$OPTARG"
+                    OUTPUT_FILE_OPT_PROVIDED=true # Set flag
                     ;;
                 v)
                     VERBOSE=true
                     ;;
                 \?)
-                    usage
+                    log_error "Invalid option: -$OPTARG" 1 # Specific error for invalid option
+                    ;;
+                :)
+                    log_error "Option -$OPTARG requires an argument." 1
                     ;;
             esac
         done
+        shift $((OPTIND-1)) # Shift past processed options
 
-        # Interactive prompt for output file if not provided and terminal is interactive
-        if [[ -z "$OUTPUT_FILE" && -t 1 ]]; then
-            read -p "${YELLOW}No output file specified. Enter output file path (default: $DEFAULT_OUTPUT): ${NC}" input
-            OUTPUT_FILE="${input:-$DEFAULT_OUTPUT}"
+        # If after shifting, there's still an argument, it's the input path
+        if [[ -n "$1" ]]; then
+            INPUT_PATH="$1"
+        fi
+        
+        # Determine the final OUTPUT_FILE:
+        # 1. If -o was provided, use that.
+        # 2. If -o was NOT provided AND we are in an interactive terminal, prompt the user.
+        # 3. Otherwise (non-interactive or -o not provided), use DEFAULT_OUTPUT.
+
+        if [[ "$OUTPUT_FILE_OPT_PROVIDED" == "true" ]]; then
+            # OUTPUT_FILE already set by getopts
+            : # Do nothing
+        elif [[ -t 1 ]]; then # If no -o and interactive
+            # Construct the prompt string conditionally
+            prompt_string="Warning: No output file specified via -o option. Enter desired output file path (or press Enter for default: ${DEFAULT_OUTPUT}): "
+            read -p "${YELLOW}${prompt_string}${NC}" input_for_output
+            OUTPUT_FILE="${input_for_output:-$DEFAULT_OUTPUT}"
+        else # Non-interactive and no -o
+            # For non-interactive, print warning without ANSI codes to stderr
+            echo "Warning: No output file specified via -o option. Using default: ${DEFAULT_OUTPUT}" >&2
+            OUTPUT_FILE="$DEFAULT_OUTPUT"
         fi
 
         # Validate output file extension
         if ! has_extension "$OUTPUT_FILE"; then
-            log_warning "Output file '$OUTPUT_FILE' has no extension. Using .txt extension."
+            if [[ -t 1 ]]; then # Only warn with colors if interactive
+                log_warning "Output file '$OUTPUT_FILE' has no extension. Using .txt extension."
+            else
+                echo "Warning: Output file '$OUTPUT_FILE' has no extension. Using .txt extension." >&2
+            fi
             OUTPUT_FILE="${OUTPUT_FILE}.txt"
         fi
-
-        # Load configurations
-        load_config
+        
+        # Ensure VERBOSE is set (it might not be if -v wasn't passed)
+        : "${VERBOSE:=false}"
 
         # Run the combine operation
         flatten_files "$INPUT_PATH" "$OUTPUT_FILE" "$VERBOSE"
         ;;
 esac
-
-# collate.sh
