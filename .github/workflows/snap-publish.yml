@@ -6,7 +6,7 @@
         branches:
           - main # This workflow runs when changes are pushed to the main branch
         tags:
-          - 'v*.*.*' # Also run on version tags (e.g., v1.0.0) for stable releases
+          - 'v0.1.0' # Also run on version tags (e.g., v1.0.0) for stable releases
 
     jobs:
       build-and-publish:
