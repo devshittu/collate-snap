@@ -483,6 +483,7 @@ exclude_dirs:
   - .mypy_cache
   - htmlcov
   - node_modules
+  - data
 
 # Files to exclude (add to system-wide exclusions)
 # Example:
