@@ -2,7 +2,7 @@
 
 # System-wide command: collate (alias: col8)
 # Combines files recursively into a single output file with configurable exclusions.
-# Supports project-specific configs (.collate/config.yaml) and system-wide settings (/etc/collate/config.yaml).
+# Supports project-specific configs (.collate/config.yaml) and system-wide settings (~/.collate/config.yaml).
 # Commands: init (initialize project config), uninit (remove project config), <path> (combine files).
 
 # Configuration paths
@@ -63,16 +63,23 @@ has_extension() {
     [[ "$filename" =~ \.[a-zA-Z0-9]+$ ]] && return 0 || return 1
 }
 
+# FIXED: Proper color handling in prompts
 prompt_overwrite() {
     local output_file_path="$1"
     if [[ -f "$output_file_path" ]]; then
         log_warning "Output file '$output_file_path' already exists."
-        local prompt_string="Overwrite? (y/N): "
-        if [[ -t 1 ]]; then
-            read -p "${YELLOW}${prompt_string}${NC}" confirm
+        
+        local confirm
+        if [[ -t 0 && -t 1 ]]; then
+            # Interactive terminal - use echo for color, then read
+            echo -ne "${YELLOW}Overwrite? (y/N): ${NC}"
+            read confirm
         else
-            read -p "${prompt_string}" confirm
+            # Non-interactive - plain text only
+            echo -n "Overwrite? (y/N): "
+            read confirm
         fi
+        
         if [[ ! "$confirm" =~ ^[yY]$ ]]; then
             log_error "Operation cancelled by user." 1
         fi
@@ -102,14 +109,13 @@ parse_yaml() {
                 fi
             fi
         elif [[ "$line" =~ ^-\  ]]; then
-            # Extract value and remove leading "- "
             local value=$(echo "$line" | sed 's/^- //')
-            # CRITICAL FIX: Remove surrounding quotes from patterns
+            # Remove surrounding quotes from patterns
             value=$(echo "$value" | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/")
-            # NEW: Normalize directory patterns - remove trailing slash and leading ./
+            # Normalize directory patterns - remove trailing slash and leading ./
             if [[ "$current_key" == "exclude_dirs" || "$current_key" == "allow_dirs" ]]; then
-                value="${value%/}"      # Remove trailing slash: cache/ -> cache
-                value="${value#./}"     # Remove leading ./: ./cache -> cache
+                value="${value%/}"
+                value="${value#./}"
             fi
             
             if [[ "$current_key" == "exclude_dirs" ]]; then
@@ -168,26 +174,21 @@ load_config() {
     [[ "$dot_dirs_setting" == "true" ]] && EXCLUDE_DOT_DIRS_FINAL=true || EXCLUDE_DOT_DIRS_FINAL=false
 }
 
-# FIXED: Improved should_exclude function with proper path matching and precedence
-# Set DEBUG_EXCLUDE=1 to enable detailed logging
 should_exclude() {
     local path="$1"
     local filename=$(basename "$path")
     local dirname_part=$(dirname "$path")
     
-    # Debug logging if enabled
     if [[ "${DEBUG_EXCLUDE:-0}" == "1" ]]; then
         echo "[DEBUG] Checking: $path" >&2
         echo "[DEBUG]   filename: $filename" >&2
     fi
     
-    # Exclude the output file itself
     if [[ "$path" == "$absolute_output_file_global" ]]; then
         [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   -> EXCLUDED (output file)" >&2
         return 0
     fi
 
-    # Normalize path to be relative to input directory for consistent matching
     local relative_path="$path"
     if [[ "$path" == "$absolute_input_path_global/"* ]]; then
         relative_path="${path#$absolute_input_path_global/}"
@@ -195,8 +196,6 @@ should_exclude() {
     
     [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   relative_path: $relative_path" >&2
     
-    # HIGHEST PRECEDENCE: Check against ALLOW_FILES first
-    # This must come before ANY exclusion checks so allows can override everything
     if [[ "${DEBUG_EXCLUDE:-0}" == "1" && ${#ALLOW_FILES[@]} -gt 0 ]]; then
         echo "[DEBUG]   Checking ALLOW_FILES: ${ALLOW_FILES[*]}" >&2
     fi
@@ -205,42 +204,35 @@ should_exclude() {
         if [[ "${DEBUG_EXCLUDE:-0}" == "1" ]]; then
             echo "[DEBUG]     Testing pattern: '$allowed_file_pattern' against '$filename'" >&2
         fi
-        # Support both literal matches and wildcards
         if [[ "$filename" == $allowed_file_pattern ]]; then
             [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   -> ALLOWED (by allow_files)" >&2
-            return 1  # DO NOT exclude
+            return 1
         fi
     done
 
-    # SECOND HIGHEST: Check against ALLOW_DIRS
-    # Files in allowed directories should not be excluded regardless of other rules
     if [[ "${DEBUG_EXCLUDE:-0}" == "1" && ${#ALLOW_DIRS[@]} -gt 0 ]]; then
         echo "[DEBUG]   Checking ALLOW_DIRS: ${ALLOW_DIRS[*]}" >&2
     fi
     
     for allowed_dir_pattern in "${ALLOW_DIRS[@]}"; do
         allowed_dir_pattern="${allowed_dir_pattern%/}"
+        allowed_dir_pattern="${allowed_dir_pattern#./}"
         
-        # Check if this file is within an allowed directory
         local IFS='/'
         local -a path_parts=($relative_path)
         for part in "${path_parts[@]}"; do
-            if [[ "$part" == "$allowed_dir_pattern" ]]; then
+            if [[ "$part" == $allowed_dir_pattern ]]; then
                 [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   -> ALLOWED (in allowed dir: $allowed_dir_pattern)" >&2
-                return 1  # DO NOT exclude
+                return 1
             fi
         done
         
-        # Also check if path starts with allowed directory
         if [[ "$relative_path" == "$allowed_dir_pattern/"* ]]; then
             [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   -> ALLOWED (starts with allowed dir: $allowed_dir_pattern)" >&2
-            return 1  # DO NOT exclude
+            return 1
         fi
     done
 
-    # Now apply exclusions (only if not already allowed above)
-    
-    # 3. Check for dot directories exclusion if enabled
     if [[ "$EXCLUDE_DOT_DIRS_FINAL" == true ]]; then
         [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   Checking dot directories..." >&2
         local IFS='/'
@@ -248,39 +240,34 @@ should_exclude() {
         for part in "${path_parts[@]}"; do
             if [[ "$part" == .* && "$part" != "." && "$part" != ".." ]]; then
                 [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   -> EXCLUDED (dot directory: $part)" >&2
-                return 0  # Exclude
+                return 0
             fi
         done
     fi
 
-    # 4. Check against EXCLUDE_DIRS with proper path segment matching
     if [[ "${DEBUG_EXCLUDE:-0}" == "1" && ${#EXCLUDE_DIRS[@]} -gt 0 ]]; then
         echo "[DEBUG]   Checking EXCLUDE_DIRS: ${EXCLUDE_DIRS[*]}" >&2
     fi
     
     for excluded_dir_pattern in "${EXCLUDE_DIRS[@]}"; do
-        excluded_dir_pattern="${excluded_dir_pattern%/}"    # Remove trailing slash
-        excluded_dir_pattern="${excluded_dir_pattern#./}"   # Remove leading ./
+        excluded_dir_pattern="${excluded_dir_pattern%/}"
+        excluded_dir_pattern="${excluded_dir_pattern#./}"
         
-        # Split path into components and check each one
         local IFS='/'
         local -a path_parts=($relative_path)
         for part in "${path_parts[@]}"; do
-            # Support wildcards in directory names (e.g., cache_*, temp*)
             if [[ "$part" == $excluded_dir_pattern ]]; then
                 [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   -> EXCLUDED (dir match: $excluded_dir_pattern)" >&2
-                return 0  # Exclude
+                return 0
             fi
         done
         
-        # Also check if the path starts with the excluded directory (for literal matches)
         if [[ "$relative_path" == "$excluded_dir_pattern/"* ]]; then
             [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   -> EXCLUDED (starts with dir: $excluded_dir_pattern)" >&2
-            return 0  # Exclude
+            return 0
         fi
     done
 
-    # 5. FIXED: Check against EXCLUDE_FILES with proper wildcard support
     if [[ "${DEBUG_EXCLUDE:-0}" == "1" && ${#EXCLUDE_FILES[@]} -gt 0 ]]; then
         echo "[DEBUG]   Checking EXCLUDE_FILES: ${EXCLUDE_FILES[*]}" >&2
     fi
@@ -289,15 +276,14 @@ should_exclude() {
         if [[ "${DEBUG_EXCLUDE:-0}" == "1" ]]; then
             echo "[DEBUG]     Testing pattern: '$excluded_file_pattern' against '$filename'" >&2
         fi
-        # Use bash pattern matching (supports *.log, *.txt, etc.)
         if [[ "$filename" == $excluded_file_pattern ]]; then
             [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   -> EXCLUDED (file match: $excluded_file_pattern)" >&2
-            return 0  # Exclude
+            return 0
         fi
     done
 
     [[ "${DEBUG_EXCLUDE:-0}" == "1" ]] && echo "[DEBUG]   -> INCLUDED (no exclusion rules matched)" >&2
-    return 1  # Do not exclude by default
+    return 1
 }
 
 show_progress() {
@@ -396,8 +382,6 @@ flatten_files() {
     log_info "Files combined successfully into '$output_file'"
 }
 
-# --- Command-Specific Help Functions ---
-
 usage() {
     cat << EOF
 ${GREEN}collate - Combine files recursively into a single output file${NC}
@@ -463,9 +447,6 @@ EOF
     exit 0
 }
 
-# --- Project Management Functions ---
-
-# IMPROVED: Better default exclusions in init_project
 init_project() {
     if [[ "$1" == "--help" ]]; then
         init_help
@@ -501,6 +482,7 @@ exclude_dirs:
   - .pytest_cache
   - .mypy_cache
   - htmlcov
+  - node_modules
 
 # Files to exclude (add to system-wide exclusions)
 # Example:
@@ -509,6 +491,9 @@ exclude_files:
   - "*.md"
   - ".env"
   - ".env.*"
+  - "*.bak"
+  - "*.backup"
+  - "*.bkp"
 
 # Directories or files to allow (overrides system-wide exclusions)
 # Example: If you want to include docs despite excluding it above:
@@ -529,6 +514,7 @@ EOF
     exit 0
 }
 
+# FIXED: Proper color handling for uninit prompt
 uninit_project() {
     if [[ "$1" == "--help" ]]; then
         uninit_help
@@ -537,9 +523,12 @@ uninit_project() {
         log_error ".collate directory does not exist in $(pwd)" 1
     fi
 
-    if [[ -t 1 ]]; then
+    local confirm
+    if [[ -t 0 && -t 1 ]]; then
         log_warning "This will remove the .collate directory and its contents."
-        read -p "${YELLOW}Proceed? (y/N): ${NC}" confirm
+        # Use echo -ne for color output, NOT printf with string interpolation
+        echo -ne "${YELLOW}Proceed? (y/N): ${NC}"
+        read confirm
         if [[ ! "$confirm" =~ ^[yY]$ ]]; then
             log_error "Operation cancelled by user." 1
         fi
@@ -605,11 +594,13 @@ case "$COMMAND" in
         
         if [[ "$OUTPUT_FILE_OPT_PROVIDED" == "true" ]]; then
             :
-        elif [[ -t 1 ]]; then
-            prompt_string="Warning: No output file specified via -o option. Enter desired output file path (or press Enter for default: ${DEFAULT_OUTPUT}): "
-            read -p "${YELLOW}${prompt_string}${NC}" input_for_output
+        elif [[ -t 0 && -t 1 ]]; then
+            # Interactive - use echo -ne for color
+            echo -ne "${YELLOW}Warning: No output file specified via -o option. Enter desired output file path (or press Enter for default: ${DEFAULT_OUTPUT}): ${NC}"
+            read input_for_output
             OUTPUT_FILE="${input_for_output:-$DEFAULT_OUTPUT}"
         else
+            # Non-interactive
             echo "Warning: No output file specified via -o option. Using default: ${DEFAULT_OUTPUT}" >&2
             OUTPUT_FILE="$DEFAULT_OUTPUT"
         fi
