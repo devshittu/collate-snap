@@ -1,9 +1,10 @@
-# Collate Quick Reference Cheatsheet
+# Collate v3.0 Quick Reference Cheatsheet
 
 ## 📚 Table of Contents
 
 - [Installation](#-installation)
 - [Basic Commands](#-basic-commands)
+- [New in v3](#-new-in-v3)
 - [Configuration](#-configuration)
 - [Common Use Cases](#-common-use-cases)
 - [Pattern Syntax](#-pattern-syntax)
